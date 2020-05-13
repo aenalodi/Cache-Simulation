@@ -1,0 +1,581 @@
+#include <stdio.h>
+#include <iostream>
+#include <cstdlib>
+#include "funcs.h"
+#include "data.h"
+#include "address.h"
+#include <math.h>
+#include <vector>
+#include <string.h>
+#include <fstream>
+#include <sstream>
+using namespace std;
+
+int hextodec(char * tok)
+{
+	int s=strlen(tok), res=0, p;
+	for(int i=0;i<s;++i){
+		if(tok[i]>='a' && tok[i] <= 'f')
+			p=(int)tok[i]-(int)'a'+10;
+		else if(tok[i]>='A' && tok[i] <= 'F')
+			p=(int)tok[i]-(int)'A'+10;
+		else
+			p=(int)tok[i]-(int)'0';
+		res+=pow(16, s-i-1)*p;
+	}
+	return res;
+}
+
+bool isIn(int c, int a, int b){
+	for(a;a<=b;++a)
+		if(c==pow(2, a)) return true;
+	return false;
+}
+
+void bubbletotop(vector<data> & cache, const int & start, const int & end){
+	data temp;
+	for(int i=end;i>start;--i){
+		temp=cache[i];
+		cache[i]=cache[i-1];
+		cache[i-1]=temp;
+	}
+
+}
+void dectobin(string &s,int dec)
+{
+	while(dec>0)
+	{
+		s= to_string((dec%2))  + s;
+		dec=dec/2;
+	}
+
+}
+void cachemiss(int & miss, vector<data> & cache, vector<int> & memory, const int & start, const int & addr, const address & a, const int & blocksize, const int & associativity, int & val,int tagbits,int indexbits,int byteoffbits,int & dirtyblock){
+	++miss;
+	val=memory[addr];
+	// reach end of set
+	const int end=start+associativity-1;
+	
+	if (cache[end].valid==true && cache[end].dirty==true)
+	{
+		dirtyblock++;
+		string newad;
+		dectobin(newad,cache[end].tag);
+		while (newad.length()<tagbits)
+			newad="0" + newad;
+		string ind;
+		dectobin(ind,a.index);
+		while (ind.length()<indexbits)
+			ind="0" + ind;
+		newad=newad+ind;
+		
+		ind="";
+		dectobin(ind,0);
+		while (ind.length()<byteoffbits)
+			ind="0" + ind;
+		newad=newad+ind;	
+		int newaddress=stoi(newad,NULL,2);
+		int mword=(newaddress/blocksize)*blocksize;
+		for(int i=0;i<blocksize;++i){
+			memory[mword+i]=cache[end].block[i];
+		}
+		cache[end].dirty=0;
+	}
+	cache[end].valid=true;
+	cache[end].tag=a.tag;
+	// identify start of block in memory
+	int mword=(addr/blocksize)*blocksize;
+	
+	for(int i=0;i<blocksize;++i)
+		cache[end].block[i]=memory[mword+i];
+	// bubble to top
+	bubbletotop(cache, start, end);
+}
+
+void cachehit(bool & found, int & hit, vector<data> & cache, const int & start, const int & i, const address & a, const int & cache_blocksize,const int & cache_associativity,int & val, const int & addr, const bool set){
+	found=true;
+	++hit;
+	bubbletotop(cache, start, start+i);
+	val=cache[start].block[a.byteoffset];
+	if(set)
+	{ //cout<<"set "<<start<<endl;
+		cache[start].dirty=set;	
+	}
+}
+
+int main (int argc, char *argv[ ])
+{
+
+ 	//the values that we get from the 
+	//command line will be put into these
+	//variables. we can use them later in the program
+	//like for checking if they have valid values
+	int cache_capacity = 0;
+	int cache_blocksize = 0;
+	int cache_associativity = 0;
+	bool split=0;		// unified/split flag
+	bool writehit=0;	// write hit flag
+				// writehit==0 means write back
+				// writehit==1 means write through
+	bool writemiss=0;	// write miss flag
+				// writemiss==0 means write allocate
+				// writemiss==1 means write no-allocate
+
+	//counting variables
+	int dataread=0,datawrite=0,instrfetch=0,dirtyblock=0;
+	int mdataread=0,mdatawrite=0,minstrfetch=0;
+	int iread=0,iwrite=0,imiss=0,idirtyblock=0;
+	int min=16777216, maxmem=0;
+
+	if(!parseParams(argc, argv, cache_capacity, cache_blocksize, cache_associativity, split, writehit, writemiss)) {
+		exit(2);
+	}
+	
+	/*if(!isIn(cache_capacity, 2, 6) || !isIn(cache_blocksize, 2, 9) || !isIn(cache_associativity, 0, 4)){
+		cout<<"Invalid arguments.\n";
+		exit(1);
+	}*/
+
+	// convert cache capacity and cache blocksize from bytes into words
+	cache_capacity/=4;
+	cache_blocksize/=4;
+	if (split==true)
+	{	//cout<<"split: "<<split<<endl;
+		cache_capacity/=2;
+	}
+	/*
+	cout << "Cache Capacity: " << cache_capacity << endl;
+	cout << "Cache BlockSize: " << cache_blocksize << endl;
+	cout << "Cache Associativity: " << cache_associativity << endl;*/
+	
+	int max=cache_capacity*pow(2, 10)/cache_blocksize;
+	if(cache_associativity>max){
+		cout<<"Associativity too high for cache capacity of "<<cache_capacity*4<<"KB and blocksize of "<<cache_blocksize*4<<" bytes."
+			"\nMaximum associativity for these values is "<<max<<'\n';
+		exit(1);
+	}
+	const int addrbits=32;
+	const int numsets=(cache_capacity*pow(2, 10))/(cache_blocksize*cache_associativity); // number of sets
+	const int setbits=log2(numsets); // set bits
+	//const int blockoffbits=log2(cache_associativity); // block offset bits
+	const int byteoffbits=log2(cache_blocksize); // byte offset bits
+	const int tagbits=addrbits-setbits/*-blockoffbits*/-byteoffbits; // tag bits
+	/*cout<<"Number of sets: "<<numsets<<
+		"\nAddress bits: "<< addrbits<<
+		"\nSet bits: "<<setbits<<
+		"\nByte Offset bits: "<<byteoffbits<<
+		"\nTag bits: "<<tagbits<<'\n';*/
+
+	const int memsize=4194304;
+
+	vector<int> memory;
+	for(int i=0;i<memsize;++i)
+		memory.push_back(i*4);
+
+	vector<data> cache;
+	for(int i=0;i<numsets;++i)
+		for(int j=0;j<cache_associativity;++j)
+			cache.push_back(data(cache_blocksize));
+	
+	
+	vector<data> Inscache;
+	if (split==1)
+	{
+		for(int i=0;i<numsets;++i)
+			for(int j=0;j<cache_associativity;++j)
+				Inscache.push_back(data(cache_blocksize));
+	}
+	
+	int rw, addr, dataword, hit=0, miss=0, pos, val, count=0;
+	address a;
+	float rate;
+	bool found;
+	string fname;
+	cin>>fname;
+	ifstream file(fname, ios::in);
+
+	if(file.is_open())
+	{
+		string s;
+		char * tok;
+		char inp[50];
+		while(getline(file,s))
+		{
+			++count;
+			strcpy(inp, s.c_str());
+			rw = stoi(strtok (inp," "));
+			addr=hextodec(strtok(NULL, " "))/4;
+			if(addr>maxmem) maxmem=addr;
+			if(addr<min) min=addr;
+			a.setter(addr, setbits, tagbits, byteoffbits, addrbits);
+			found=false;
+			if(rw==0)
+			{	// Data Load
+				dataread++;
+				pos=cache_associativity*(a.index);
+				for(int i=0;i<cache_associativity;++i)
+				{
+
+					if(cache[pos+i].valid)
+					{
+					
+						// check tag
+						if(a.tag==cache[pos+i].tag)
+						{
+							cachehit(found, hit, cache, pos, i, a, cache_blocksize, cache_associativity, val, addr, 0);
+							i=cache_associativity;
+						}
+					}
+				}
+				if(!found)
+				{ // miss
+					mdataread++;
+					cachemiss(miss, cache, memory, pos, addr, a, cache_blocksize, cache_associativity, val,tagbits,setbits,byteoffbits,dirtyblock);
+				}
+			}
+			else if(rw==1)
+			{	// Data Store
+				datawrite++;
+				dataword=hextodec(strtok(NULL, " "));
+				pos=cache_associativity*(a.index);
+
+				for(int i=0;i<cache_associativity;++i)
+				{
+					if(cache[pos+i].valid){
+						// check tag
+						if(a.tag==cache[pos+i].tag){
+							if(writehit==0)
+							{ // write back
+								cachehit(found, hit, cache, pos, i, a, cache_blocksize, cache_associativity, val, addr, 1);
+								cache[pos].block[a.byteoffset]=dataword;
+							} 
+							else 
+							{	 // write through
+								memory[addr]=dataword;
+								cachehit(found, hit, cache, pos, i, a, cache_blocksize, cache_associativity, val, addr, 0);
+							}
+						}
+					}
+				}
+				if(!found)
+				{ // miss
+					mdatawrite++;
+					
+						memory[addr]=dataword;// miss and write allocate
+						if(writemiss==0)
+						{ // write allocate and write back or write through
+							cachemiss(miss, cache, memory, pos, addr, a, cache_blocksize, cache_associativity, val,tagbits,setbits,byteoffbits,dirtyblock);
+						}
+					
+					// on write no allocate value is not brought to the cache
+					
+				}
+			}
+			else if(rw==2)
+			{	// Instruction Load
+				if (split==0)
+				{
+					instrfetch++;
+					pos=cache_associativity*(a.index);
+					for(int i=0;i<cache_associativity;++i)
+					{
+						if(cache[pos+i].valid)
+						{
+						// check tag
+							if(a.tag==cache[pos+i].tag)
+							{
+								cachehit(found, hit, cache, pos, i, a, cache_blocksize, cache_associativity, val, addr, 0);
+								
+								i=cache_associativity;
+							}
+						}
+					}
+					if(!found)
+					{ // miss
+						minstrfetch++;
+						cachemiss(miss, cache, memory, pos, addr, a, cache_blocksize, cache_associativity, val,tagbits,setbits,byteoffbits,dirtyblock);
+						
+					}
+				}
+				else if(split==1)
+				{
+					instrfetch++;
+					pos=cache_associativity*(a.index);
+					for(int i=0;i<cache_associativity;++i)
+					{
+						if(Inscache[pos+i].valid)
+						{
+						// check tag
+							if(a.tag==Inscache[pos+i].tag)
+							{
+								cachehit(found, hit, Inscache, pos, i, a, cache_blocksize, cache_associativity, val, addr, 0);
+								
+								i=cache_associativity;
+							}
+						}
+					}
+					if(!found)
+					{ // miss
+						minstrfetch++;
+						cachemiss(miss, Inscache, memory, pos, addr, a, cache_blocksize, cache_associativity, val,tagbits,setbits,byteoffbits,idirtyblock);
+						
+					}
+				}
+			}
+
+		}
+		file.close();
+		string newad;
+		for(int i=0;i<numsets;++i)
+		{
+			for(int j=0;j<cache_associativity;++j)
+			{
+				int k=i*cache_associativity +j;
+				if (cache[k].valid==true && cache[k].dirty==true)
+				{
+					newad="";
+					bin(newad,cache[k].tag, tagbits);
+					//while (newad.length()<tagbits)
+					//	newad="0" + newad;
+					string ind;
+					bin(ind,i, setbits);
+			
+					//while (ind.length()<setbits)
+					//	ind="0" + ind;
+					newad=newad+ind;
+					ind="";
+
+					bin(ind,0, byteoffbits);
+					//while (ind.length()<byteoffbits)
+					//	ind="0" + ind;
+					newad=newad+ind;
+					int newaddress=decimal(newad);
+					int mword=(newaddress/cache_blocksize)*cache_blocksize;
+					for(int m=0;m<cache_blocksize;++m)
+					{
+						memory[mword+m]=cache[k].block[m];
+					}
+					cache[k].dirty=0;
+				}
+			}
+		}
+
+		if(split)
+		{ cout<<"DATA CACHE\n";
+			cout<<"Total: "<<dataread+datawrite<<"  Dataread: "<<dataread<<" Datawrite:  "<<datawrite<<endl;
+		cout<<"Misses: "<<float(mdataread+mdatawrite)/(dataread+datawrite)<<"  Dataread: "<<float(mdataread)/dataread<<" Datawrite:  "<<float(mdatawrite)/datawrite<<endl;	
+		}
+		else
+		{
+			 cout<<"CACHE\n";
+			cout<<"Total: "<<count<<"  Dataread: "<<dataread<<" Datawrite:  "<<datawrite<<"  InstrFetch: "<<instrfetch<<endl;
+		cout<<"Misses: "<<float(miss)/count<<"  Dataread: "<<float(mdataread)/dataread<<" Datawrite:  "<<float(mdatawrite)/datawrite<<"  InstrFetch: "<<float(minstrfetch)/instrfetch<<endl;
+		}
+		string st;
+		
+		cout<<"No of dirty blocks evicted from cache: "<<dirtyblock<<endl<<endl;
+		int l, z;
+		cout<<"Set\tLRU  V  Tag\t Dirty\t";
+		for (int i=0;i<cache_blocksize;i++)
+		{
+			cout<<"Word"<<i;
+			l=i;
+			z=0;
+			while(l>0){
+				l/=10;
+				++z;
+			}
+			z=8-z;
+			while(z>0){
+				--z;
+				cout<<" ";
+			}
+		}
+		cout<<endl;
+		for (int k=0;k<numsets;k++)
+		{
+			cout<<k;
+			for(int i=0;i<cache_associativity;++i)
+			{
+				cout<<"\t";
+				if(i==cache_associativity-1 && cache_associativity!=1) cout<<1;
+				else cout<<0;
+				cout<<"    ";
+				cout<<cache[i+k*cache_associativity].valid<<"  ";
+					stringstream s;
+					s<<hex<<cache[i+k*cache_associativity].tag;
+					st=s.str();
+					l=8-(st.length());
+					while (l>0)
+					{
+						cout<<"0";
+						l--;
+					}
+					cout<<st<<"    ";
+				
+				//cout<<hex<<cache[i+k*cache_associativity].tag<<"\t";
+				cout<<dec<<cache[i+k*cache_associativity].dirty<<"\t";
+				for(int j=0;j<cache_blocksize;++j)
+				{
+					stringstream s;
+					s<<hex<<cache[i+k*cache_associativity].block[j];
+					st=s.str();
+					l=8-(st.length());
+					while (l>0)
+					{
+						cout<<"0";
+						l--;
+					}
+					cout<<st<<"    ";
+				}
+				cout<<endl;
+			}
+		}
+		
+
+	if (split==true)
+	{
+		cout<<endl<<endl<<"INSTRUCTION CACHE"<<endl;		
+		string st;
+		cout<<"InstrFetch Total: "<<instrfetch<<endl;
+		cout<<"Misses: "<<"InstrFetch: "<<float(minstrfetch)/instrfetch<<endl;
+		cout<<"No of dirty blocks evicted from cache: "<<idirtyblock<<endl<<endl;
+		int l, z;
+		cout<<"Set\tLRU  V  Tag\t Dirty\t";
+		for (int i=0;i<cache_blocksize;i++)
+		{
+			cout<<"Word"<<i;
+			l=i;
+			z=0;
+			while(l>0){
+				l/=10;
+				++z;
+			}
+			z=8-z;
+			while(z>0){
+				--z;
+				cout<<" ";
+			}
+		}
+		cout<<endl;
+		for (int k=0;k<numsets;k++)
+		{
+			cout<<k;
+			for(int i=0;i<cache_associativity;++i)
+			{
+				cout<<"\t";
+				if(i==cache_associativity-1 && cache_associativity!=1) cout<<1;
+				else cout<<0;
+				cout<<"    ";
+				cout<<Inscache[i+k*cache_associativity].valid<<"  ";
+					stringstream s;
+					s<<hex<<Inscache[i+k*cache_associativity].tag;
+					st=s.str();
+					l=8-(st.length());
+					while (l>0)
+					{
+						cout<<"0";
+						l--;
+					}
+					cout<<st<<"    ";
+				
+				//cout<<hex<<cache[i+k*cache_associativity].tag<<"\t";
+				cout<<dec<<Inscache[i+k*cache_associativity].dirty<<"\t";
+				for(int j=0;j<cache_blocksize;++j)
+				{
+					stringstream s;
+					s<<hex<<Inscache[i+k*cache_associativity].block[j];
+					st=s.str();
+					l=8-(st.length());
+					while (l>0)
+					{
+						cout<<"0";
+						l--;
+					}
+					cout<<st<<"    ";
+				}
+				cout<<endl;
+			}
+		}
+	
+	}
+		cout<<"\nMAIN MEMORY\nAddress\t\tWords\n";
+		//cout<<min<<' '<<maxmem<<endl;
+		int start=(1060643/cache_blocksize)*cache_blocksize;
+		for (int i=start;i<start+256;i+=cache_blocksize){
+			stringstream s;
+			s<<hex<<memory[i];
+			st=s.str();
+			l=8-(st.length());
+			while (l>0)
+			{
+				cout<<"0";
+				l--;
+			}
+			cout<<st<<"\t";
+			for(int j=0;j<cache_blocksize;++j){
+				stringstream s;
+				s<<hex<<memory[i+j];
+				st=s.str();
+				l=8-(st.length());
+				while (l>0)
+				{
+					cout<<"0";
+					l--;
+				}
+				cout<<st<<"    ";
+			}
+			cout<<endl;
+		}
+	} else cout<<"Error opening file\n";
+
+
+
+}
+
+
+Impact Of Working Set Characterization
+
+In this experiment we show the effect of the cache capacity on the hit rate.
+
+In each case we observe that the hit rate either increases or stays the same as cache size increases. This is because the cache has greater capacity to store values, therefore it has more sets. So the range of indices that can be stored in the cache increases, allowing for more values to be stored, and as a result there are more hits with a higher cache size. But at a point the cache becomes too saturated with sets and has no more need for more sets so the hit rate becomes constant eventually.
+
+The following graphs show hit rate against cache size for both instruction and data caches in a split cache:
+
+cc.trace
+In this graph we observe that, in both cases of instruction and data caches, the hit rate increases with cache size, eventually becoming constant. The increase is greater in the beginning of the graph. Also, increasing the cache size has had a greater effect on the instruction cache by comparison to the data cache.
+The total size at which the hit rate becomes constant is 64KB (ie. 32KB for the data cache and 32KB for the instruction cache).
+spice.trace
+In this graph, again both instruction and data caches’ hit rates increase until they become constant, and again the effect has been much greater for the instruction cache than the data cache. But in this case the hit rate of the instruction cache surpassed that of the data cache, despite being initially very low.
+Again the total size is 64KB, equally divided between the two parts of the split cache.
+tex.trace
+For tex.trace the hit rate was already constant by the second iteration; the cache size appeared not to make any difference on the hit rate at all.
+We can say that the smallest total size the cache was constant at was 8KB – 4KB each for instruction and data.
+Impact Of Block Size
+
+In this experiment we observe the effect that the block size has on the hit rate of the cache.
+
+We observe that hit rate increases with cache block size until a point, after which it drops again. The reason for this has to do with spatial locality: when the blocksize is greater, then it means there will be less tags in the cache overall (given a constant cache size, and with each tag having more data stored against it). This increases competition between data with different tags, as fewer tags can actually be stored. As a result the hit rate goes down since there are more misses from accessing data from addresses with different tags.
+
+Optimal block size can depend upon spatial locality, ie. if accesses are being made from relatively close-by data then increasing block size will increase hit rate. This means that compulsory misses are greater for smaller blocksize – however, for greater blocksize, there will be more conflict misses.
+The optimal block size is found at the balance between these two points, when the gradient of the graph becomes 0.
+
+The optimal block size may differ between data references and instruction references; this is because of the spatial locality of the accesses, ie. how close or far away accesses are from each other in terms of memory space and time of access. Instructions appear to be less affected by block size, implying that they are mostly close together in the memory and called in a way that they share tags with existing values in the cache.
+
+
+
+Impact Of Associativity
+
+In this experiment we observe the effect that the associativity has on the hit rate of the cache.
+
+Hit rate increases with associativity because with greater associativity, more tags are checked for each set/index. So more tags sharing the same index can be stored in the cache.
+
+
+
+
+
+
+
+
+
+
